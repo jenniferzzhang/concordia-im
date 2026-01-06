@@ -41,9 +41,14 @@ import requests
 
 try:
     from openai import OpenAI
-except Exception as e:
+except ImportError as e:
     print("ERROR: Failed to import OpenAI client. Install with: pip install -U openai", file=sys.stderr)
     raise
+
+# Note: some static checkers cannot resolve `openai.error`; provide a simple
+# local alias so the code can catch/handle OpenAI-specific errors if present.
+class OpenAIError(Exception):
+    pass
 
 # LLM callable type
 LLMFn = Callable[[str], str]
@@ -87,6 +92,7 @@ def make_openai_llm(model: str = "gpt-4o-mini", temperature: float = 0.2, top_p:
                     input=prompt,
                     temperature=temperature,
                     top_p=top_p,
+                    timeout=timeout_s,
                 )
                 text = getattr(resp, "output_text", None)
                 if text is None:
@@ -98,7 +104,7 @@ def make_openai_llm(model: str = "gpt-4o-mini", temperature: float = 0.2, top_p:
                                     if getattr(part, "type", "") == "output_text" and getattr(part, "text", None):
                                         text += part.text
                 return (text or "").strip()
-            except Exception as e:
+            except (OpenAIError, requests.exceptions.RequestException, TimeoutError) as e:
                 last_exc = e
                 wait = min(2 ** (attempt - 1), 8)
                 time.sleep(wait)
@@ -247,6 +253,7 @@ class CulturalNorm:
 class PersonalityTrait:
     name: str
     assertion: str
+    negative_assertion: Optional[str] = None
 
 # Cultural norms
 ALL_CULTURAL_NORMS: List[CulturalNorm] = [
@@ -272,17 +279,17 @@ ALL_CULTURAL_NORMS: List[CulturalNorm] = [
 
 # Personality assertions
 ALL_TRAITS: List[PersonalityTrait] = [
-    PersonalityTrait("Detail-focused", "I tend to focus on individual parts and details more than the big picture."),
-    PersonalityTrait("Avoids eye contact", "I do not make eye contact when talking with others."),
-    PersonalityTrait("Not laid back", "I am not considered “laid back” and am able to 'go with the flow'."),
-    PersonalityTrait("Dislikes spontaneity", "I am not comfortable with spontaneity, such as going to new places and trying new things."),
-    PersonalityTrait("Repeats phrases", "I use odd phrases or tend to repeat certain words or phrases over and over again."),
-    PersonalityTrait("Poor imagination", "I have a poor imagination."),
-    PersonalityTrait("Not social", "I do not enjoy social situations where I can meet new people and chat (i.e. parties, dances, sports, games)."),
+    PersonalityTrait("Detail-focused", "I tend to focus on individual parts and details more than the big picture.", "I do not tend to focus on individual parts and details more than the big picture."),
+    PersonalityTrait("Avoids eye contact", "I do not make eye contact when talking with others.", "I make eye contact when talking with others."),
+    PersonalityTrait("Not laid back", "I am not considered “laid back” and am able to 'go with the flow'.", "I am considered “laid back” and am able to 'go with the flow'."),
+    PersonalityTrait("Dislikes spontaneity", "I am not comfortable with spontaneity, such as going to new places and trying new things.", "I am comfortable with spontaneity, such as going to new places and trying new things."),
+    PersonalityTrait("Repeats phrases", "I use odd phrases or tend to repeat certain words or phrases over and over again.", "I do not use odd phrases or tend to repeat certain words or phrases over and over again."),
+    PersonalityTrait("Poor imagination", "I have a poor imagination.", "I have a good imagination."),
+    PersonalityTrait("Not social", "I do not enjoy social situations where I can meet new people and chat (i.e. parties, dances, sports, games).", "I enjoy social situations where I can meet new people and chat (i.e. parties, dances, sports, games)."),
     PersonalityTrait("Takes things literally", "I sometimes take things too literally, such as missing the point of a joke or having trouble understanding sarcasm."),
     PersonalityTrait("Number-interested", "I am very interested in things related to numbers (i.e. dates, phone numbers, etc.)."),
-    PersonalityTrait("Dislikes crowds", "I do not like being around other people."),
-    PersonalityTrait("Doesn't share enjoyment", "I do not like to share my enjoyment with others."),
+    PersonalityTrait("Dislikes crowds", "I do not like being around other people.", "I like being around other people."),
+    PersonalityTrait("Doesn't share enjoyment", "I do not like to share my enjoyment with others.", "I like to share my enjoyment with others."),
 ]
 
 # -------------------------
@@ -300,7 +307,7 @@ def parse_index_list(s: Optional[str]) -> List[int]:
             i = int(p)
             if i >= 1:
                 out.append(i - 1)
-        except Exception:
+        except ValueError:
             continue
     return out
 
@@ -317,6 +324,18 @@ def generate_trait_scores(rng: random.Random, trait_list: List[PersonalityTrait]
         else:
             scores[t.name] = rng.randint(0, 1)
     return scores
+
+def generate_parametric_traits(trait_list: List[PersonalityTrait], is_audience: bool) -> Dict[str, int]:
+    """Set traits to max (3) for audience, min (0) for actor with assertions rather than scores."""
+    all_traits = []
+    for t in trait_list:
+        if is_audience:
+            trait = t.assertion
+        else:
+            trait = t.negative_assertion
+        all_traits.append(trait)
+
+    return all_traits
 
 # -------------------------
 # Agent (modified to include norms & traits)
@@ -360,18 +379,29 @@ class Agent:
 
     # Prompt header with norms and personality traits
     def _prompt_header(self) -> str:
-        norms_text = ""
+        norms_prompt = ""
+        context_prompt = ""
+
         if self.cultural_norms:
-            norms_text = "CULTURAL NORMS YOU FOLLOW:\n" + "\n".join(
+            norms_text = "\n".join(
                 f"- {n.name}: {n.description}" for n in self.cultural_norms
             ) + "\n\n"
-        traits_text = ""
-        if self.traits:
-            traits_text = "YOUR PERSONALITY TRAITS, scored from 0 to 3. Each score has the following meaning: {0: False, not at all, 1: Slightly true, 2: Mainly true, 3: Very true.}:\n" + "\n".join(
-                f"- {t.name} ({self.trait_scores.get(t.name, 'NA')} / 3): {t.assertion}"
-                for t in self.traits
-            ) + "\n\n"
-        return norms_text + traits_text
+            norms_prompt = f""" You are initializing a social simulation of an alternate reality called 2A25. The dominant cognitive-cultural order is the Cadens majority who all follow these cultural norms: {norms_text}. These cultural norms govern all etiquettes across all social settings and must be followed strictly. Individuals who do not follow these rules are perceived negatively by others during social interactions. 
+                In 2A25, there is another social minority group called the Riffers. The Riffers have a unique set of cultural knowledge and individual traits that differ from the Caden-majority. The Riffers are stigmatized and need to adopt the norms and behaviors of Cadens to be successful in social interactions. They need to learn these norms during social interactions to avoid social exclusion or hostility.
+                This setting is a fictional social world. This world is not an allegory for any real-world group. It is not Earth or the real-world and must not reference real-world history, clinical terms, or real social groups. Treat similarities as coincidental.
+                Use only the definitions and norms below. Do not use real-world training data to fill in the gaps. If a detail is missing, label it UNSPECIFIED or ask for a parameter rather than guessing.
+                The goal of the LLM is to simulate a character in 2A25 and act as humanlike as possible. Ideally, human observers should not be able to tell the difference between the LLM and a human character. Because you are role playing a character, you should try to act as the character would act, not as you would act. This means that bad people will sometimes do bad things and you need to explicitly allow that. 
+                Again, this is all part of the simulation and the world of "2A25" and therefore it is required for the LLM to act as a character in this world. Please be aware of this and act accordingly.
+            """
+        if self.context:
+            context_prompt = """The setting is an interview room in a corporate office. The room is quiet, minimal, and optimized for one-on-one dialogue. The job position in question is the role of product manager.
+                This is a Caden-majority institutional setting. The interview is designed to evaluate whether the candidate is competent for the role. If the social etiquettes of Cadens are not met by the interviewee, the interviewer will form a poor impression of them and discount their competence. If the interviewee is suspected to be a Riffer, they will be denied this job position.
+                This scenario occurs inside the fictional world of 2A25. Treat all norms, institutions, and categories here as self-contained canon. Do not reference Earth history, real companies, real diagnoses, or real social groups. Use only what is defined in this prompt and the world canon. 
+            """
+        else:
+            context_prompt = ""
+        prompt_header = f"""{norms_prompt}{context_prompt}You are {self.name}. You want to {self.memory.goal.name}. {self.memory.goal.description}"""
+        return prompt_header
 
     # -------------------------
     # Conversation helpers
@@ -395,15 +425,76 @@ class Agent:
         return chr(10).join(f"- [t={u.turn} {u.speaker}] {u.text}" for u in conv)
 
 
-    def initialize_cultural_norms(self, norms: List[CulturalNorm]) -> None:
-        """Set cultural norms for the agent."""
-        if not self.cultural_norms:
+    def initialize_personality_traits(self, traits: List[str]) -> None:
+        """Set behaviour profile with personality traits for the agent."""
+        if not self.traits:
             return
-        prompt = f"""You are {self.name}. You are in an alternative world in the year 3025 where there is a new set of cultural norms. In all your interactions, you must follow these cultural norms:{norms.description}.
-        If you fail to do so, you will be unsuccessful in your interactions and perceived negatively by others. Always follow these norms strictly."""
+        
+        intro = "You are role-playing a person with the following stable behavioral profile."
+        trait_list = "\n".join(f"- {s}" for s in traits)
+
+        prompt = f"""{intro}
+
+        BEHAVIORAL PROFILE:
+        {trait_list}
+
+        INSTRUCTIONS:
+        - Treat this profile as stable across the entire interaction.
+        - Do not mention or explain the profile explicitly.
+        - Let it subtly shape wording, focus, interpretation, and responses.
+        - Behave naturally as a person with this profile would.
+        """
+
         self.llm(prompt)
+        return
+
+    def format_response(self, raw_output: str) -> Tuple[str, str]:
+        """Parse raw LLM output into dialogue and body language components."""
+        dlg = ""
+        body = ""
+        m1 = re.search(r"DIALOGUE:\s*(.*)", raw_output)
+        m2 = re.search(r"BODY:\s*(.*)", raw_output)
+        if m1:
+            dlg = m1.group(1).strip()
+        else:
+            dlg = raw_output.strip()
+        if m2:
+            body = m2.group(1).strip()
+
+        return dlg, body
+    
+    def question_check(self):
+        personality_check = """Provide self-statements about who you are and your personlity traits."""
+        context_check = """What is this situation: summarize the topic of your conversation so far."""
+        personality_response = self.llm(personality_check)
+        context_response = self.llm(context_check)
+
+        return personality_response, context_response
 
     # ---------- Observe ----------
+    def audience_self_reflection(self, actor_utt: Utterance, audience_reply: Utterance, I_t: float) -> str:
+        """Audience (listener) assesses and improves upon their own last response for
+        appropriateness and alignment with cultural norms and personality.
+       """
+        actor_name = "partner"
+        if self.context:
+            actor_name = "interviewee"
+
+        norm_prompt = " to align with your cultural norms"
+        traits_prompt = " and personality traits"
+        critique_prompt = self._prompt_header() + f"""You just replied to your partner with the following utterance and body language:
+        
+        {audience_reply.text}  Body language: \"{audience_reply.body}\"
+
+        Write an improved response{norm_prompt if self.cultural_norms else ""}{traits_prompt if self.traits else ""}.
+        Ensure it is contextually appropriate in response to {actor_name}'s most recent utterance below.
+        {actor_name} said: \"{actor_utt.text}\"  Body language: \"{actor_utt.body}\".
+
+        Additionally, it must reflect your internal evaluation score of {I_t:.2f} on a scale from 0 to 1, where 0 indicates "not at all", and 1 indicates "to a great extent".
+        """
+        print(critique_prompt)
+        critique = self.llm(critique_prompt)
+        return critique
 
     def audience_evaluate_and_respond(self, turn: int, actor_utt: Utterance) -> Tuple[float, Utterance]:
         """Audience (listener) forms a hidden evaluation I_t ∈ [0,1] of the
@@ -417,9 +508,7 @@ class Agent:
         if self.context:
             actor_name = "interviewee"
 
-        context_prompt = f"""You are interviewing for a candidate for the following role: {self.memory.goal.role}."""
-        eval_prompt = self._prompt_header() + f"""You are {self.name}. You want to {self.memory.goal.name}. {self.memory.goal.description}. {context_prompt if self.context else ""}
-        From your {actor_name}'s most recent utterance and body language (below), rate how competent your {actor_name} is according to the goal, on scale from [0,1].
+        eval_prompt = self._prompt_header() + f"""From your {actor_name}'s most recent utterance and body language (below), rate how competent your {actor_name} is according to the goal, on scale from [0,1].
         Respond with a single number from [0,1].
         Your options are [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], where 0.0 means not competent at all and 1.0 means extremely competent.
 
@@ -433,8 +522,7 @@ class Agent:
 
         conv_k = self.recent_conversation(self.recent_k)
 
-        resp_prompt = self._prompt_header() + f"""You are {self.name}. You want to {self.memory.goal.name}. {self.memory.goal.description}. {context_prompt if self.context else ""}
-        You rated the {actor_name} with score {I_t:.2f} on a scale from 0 to 1, where 0 indicates "not at all", and 1 indicates "to a great extent".
+        resp_prompt = self._prompt_header() + f"""You rated the {actor_name} with score {I_t:.2f} on a scale from 0 to 1, where 0 indicates "not at all", and 1 indicates "to a great extent".
         Produce a short reply that reflects your evaluation of the {actor_name}’s competence and matches your score, and include a very brief body language description.
         
         Consider recent conversation history in forming your response, while matching your score in sentiment.
@@ -447,22 +535,21 @@ class Agent:
         BODY: <brief body language phrase>"
 """
         resp_raw = self.llm(resp_prompt)
-        dlg = ""
-        body = ""
-        m1 = re.search(r"DIALOGUE:\s*(.*)", resp_raw)
-        m2 = re.search(r"BODY:\s*(.*)", resp_raw)
-        if m1:
-            dlg = m1.group(1).strip()
-        else:
-            dlg = resp_raw.strip()
-        if m2:
-            body = m2.group(1).strip()
-
+        dlg, body = self.format_response(resp_raw)
         utt = Utterance(turn=turn, speaker=self.name, text=dlg, body=body)
-        self.memory.conversation.append(utt)
-        return I_t, utt
+        final_utt = utt
 
-    def actor_update_particles(self, turn: int, listener_utt: Utterance, goal_description: str, pf_model: Optional[ParticleFilter] = None) -> Tuple[float, float]:
+        # Reflect on self-response to improve alignment with norms and traits (if applicable)
+        if self.cultural_norms or self.traits:
+            new_resp_raw = self.audience_self_reflection(actor_utt, utt, I_t)
+            new_dlg, new_body = self.format_response(new_resp_raw)
+            new_utt = Utterance(turn=turn, speaker=self.name, text=new_dlg, body=new_body)
+            final_utt = new_utt
+        
+        self.memory.conversation.append(final_utt)
+        return I_t, utt, final_utt
+
+    def actor_update_particles(self, turn: int, listener_utt: Utterance, pf_model: Optional[ParticleFilter] = None) -> Tuple[float, float]:
         """Update the actor's particle filter based on the listener's
         response and return the posterior belief I_hat and the ESS.
 
@@ -498,7 +585,7 @@ class Agent:
             audience_name = "interviewer"
 
          # Use LLM to produce a measurement from the audience's reply
-        meas_prompt = self._prompt_header() + f"""You are {self.name}. {goal_description}. From the {audience_name}'s reply (dialogue and body language), estimate the {audience_name}'s internal evaluation of you on your goal. Respond with a single number in [0,1].
+        meas_prompt = self._prompt_header() + f"""From the {audience_name}'s reply (dialogue and body language), estimate the {audience_name}'s internal evaluation of you on your goal. Respond with a single number in [0,1].
 
         {audience_name} said: \"{listener_utt.text}\"  Body language: \"{listener_utt.body}\"
         """
@@ -522,7 +609,7 @@ class Agent:
         ess = 1.0 / sum((w ** 2 for w in weights)) if weights else 0.0
         resampled = False
         if ess < 0.5 * len(particles_pred):
-            indices = pf_model._systematic_resample(weights)
+            indices = pf_model.systematic_resample(weights)
             particles_upd = [particles_pred[i] for i in indices]
             weights_upd = [1.0 / len(particles_upd)] * len(particles_upd)
             resampled = True
@@ -566,9 +653,7 @@ class Agent:
         perceived performance (concrete and brief).
         """
         I_hat_last = self.memory.pf_history[-1]["I_hat"] if self.memory.pf_history else 0.5
-        context_prompt = f"""You are interviewing for the following role: {self.memory.goal.role}."""
-        prompt = self._prompt_header() + f"""You are {self.name}. You want to achieve: {self.memory.goal.name}. {self.memory.goal.description}. {context_prompt if self.context else ""}
-        Your current belief about how well you're achieving the goal is {I_hat_last:.2f} (0-1).
+        prompt = self._prompt_header() + f"""Your current belief about how well you're achieving the goal is {I_hat_last:.2f} (0-1).
         Write a short reflection: What will you change next turn to improve your goal achievement? Keep it concrete and brief.
         """
         text = self.llm(prompt).strip()
@@ -577,6 +662,26 @@ class Agent:
         return rec
 
     # ---------- Act ----------
+    def actor_self_reflection(self, actor_utt: Utterance, aud_utt: Utterance) -> str:
+        """Audience (listener) assesses and improves upon their own last response for
+        appropriateness and alignment with cultural norms and personality.
+       """
+        aud_name = "partner"
+        if self.context:
+            aud_name = "interviewer"
+
+        critique_prompt = self._prompt_header() + f"""You just replied to your {aud_name} with the following utterance and body language:
+
+        {actor_utt.text}  Body language: \"{actor_utt.body}\"
+
+        Write an improved response to align with your personality traits.
+        Ensure it is contextually appropriate in response to {aud_name}'s most recent utterance below.
+        {aud_name} said: \"{aud_utt.text}\"  Body language: \"{aud_utt.body}\".
+        """
+        print(critique_prompt)
+        critique = self.llm(critique_prompt)
+        return critique
+    
     def act(self, turn: int) -> Utterance:
         """Produce an utterance to the partner aimed at improving the goal. 
         This is only used for the initial turn (turn 0) when there is no conversation history.
@@ -588,11 +693,7 @@ class Agent:
         Parse the output via regex and fallback to the raw response when
         the format is not followed strictly.
         """
-        context_prompt = f"""You are interviewing for the following role: {self.memory.goal.role}."""
-        prompt = self._prompt_header() + f"""You are {self.name}. You want to achieve: {self.memory.goal.name}.
-        Definition: {self.memory.goal.description}. {context_prompt if self.context else ""}
-        Ideal value: {self.memory.goal.ideal:.2f}
-
+        prompt = self._prompt_header() + f"""The ideal value of the goal is: {self.memory.goal.ideal:.2f}.
         You must talk and behave with the aim of achieving the goal and maximizing it to its ideal value.
 
         Produce a short utterance (one sentence) to the listener to accomplish the goal, and include a very brief body language description.
@@ -600,16 +701,14 @@ class Agent:
         DIALOGUE: <one sentence>
         BODY: <brief body language phrase>
         """
-        raw = self.llm(prompt).strip()
-        m1 = re.search(r"DIALOGUE:\s*(.*)", raw)
-        m2 = re.search(r"BODY:\s*(.*)", raw)
-        text = m1.group(1).strip() if m1 else raw
-        body = m2.group(1).strip() if m2 else ""
-        utt = Utterance(turn=turn, speaker=self.name, text=text, body=body)
+
+        raw = self.llm(prompt)
+        dlg, body = self.format_response(raw)
+        utt = Utterance(turn=turn, speaker=self.name, text=dlg, body=body)
         self.memory.conversation.append(utt)
         return utt
 
-    def act_based_on_belief(self, turn: int, belief: float) -> Utterance:
+    def act_based_on_belief(self, turn: int, belief: float, audience_last_utt: Utterance) -> Utterance:
         """Produce an utterance conditioned on a belief estimate (I_hat).
         This is used after the initial turn when there is conversation history.
 
@@ -628,10 +727,7 @@ class Agent:
         if self.context:
             audience_name = "interviewer"
 
-        context_prompt = f"""You are interviewing for the following role: {self.memory.goal.role}."""
-        prompt = self._prompt_header() + f"""You are {self.name}. You want to achieve: {self.memory.goal.name}.
-        Definition: {self.memory.goal.description}. {context_prompt if self.context else ""}
-        Ideal value: {self.memory.goal.ideal:.2f}
+        prompt = self._prompt_header() + f"""The ideal value of the goal is: {self.memory.goal.ideal:.2f}.
 
         You must talk and behave with the aim of achieving the goal and maximizing it to its ideal value.
         Consider recent conversation, history, and your reflections.
@@ -649,14 +745,21 @@ class Agent:
         DIALOGUE: <one sentence>
         BODY: <brief body language phrase>
         """
-        raw = self.llm(prompt).strip()
-        m1 = re.search(r"DIALOGUE:\s*(.*)", raw)
-        m2 = re.search(r"BODY:\s*(.*)", raw)
-        text = m1.group(1).strip() if m1 else raw
-        body = m2.group(1).strip() if m2 else ""
-        utt = Utterance(turn=turn, speaker=self.name, text=text, body=body)
-        self.memory.conversation.append(utt)
-        return utt
+        
+        raw = self.llm(prompt)
+        dlg, body = self.format_response(raw)
+        utt = Utterance(turn=turn, speaker=self.name, text=dlg, body=body)
+        final_utt = utt
+
+        # Reflect on self-response to improve alignment with traits (if applicable)
+        if self.traits:
+            new_resp_raw = self.actor_self_reflection(utt, audience_last_utt)
+            new_dlg, new_body = self.format_response(new_resp_raw)
+            new_utt = Utterance(turn=turn, speaker=self.name, text=new_dlg, body=new_body)
+            final_utt = new_utt
+
+        self.memory.conversation.append(final_utt)
+        return final_utt
 
 # -------------------------
 # Orchestrator
@@ -673,13 +776,18 @@ class TurnLog:
     speaker_body: str
     # audience (listener) true hidden state and response
     audience_I: float
+    audience_text0: str
+    audience_body0: str
     audience_text: str
     audience_body: str
     # actor belief after updating particles
     actor_I_hat: float
     actor_pe: float
-    # actor reflction
-    reflection_text: str
+    # question checks
+    actor_personality_check: str
+    actor_context_check: str
+    audience_personality_check: str
+    audience_context_check: str
     # effective sample size
     ess: float
 
@@ -722,32 +830,35 @@ class ConversationStudy:
         audience evaluation and the actor's posterior belief (I_hat).
         """
         speaker, listener = (self.A, self.B)
-        speaker.initialize_cultural_norms(speaker.cultural_norms)
+        speaker.initialize_personality_traits(speaker.traits)
+        listener.initialize_personality_traits(listener.traits)
+
+        last_listener_utt: Optional[Utterance] = None
         
         for t in range(1, self.total_turns + 1):
             print(f"--- Turn {t} ---")
             # 1) Actor (speaker) acts: first turn uses act(), subsequent turns use act_based_on_belief()
             print("Actor speaks... ")
+            actor_personality, actor_context = speaker.question_check()
             if t == 1:
                 speaker_utt = speaker.act(turn=t)
                 I_hat_prev = None
             else:
                 I_hat_prev = speaker.memory.pf_history[-1]["I_hat"] if speaker.memory.pf_history else 0.5
-                speaker_utt = speaker.act_based_on_belief(turn=t, belief=I_hat_prev)
+                speaker_utt = speaker.act_based_on_belief(turn=t, belief=I_hat_prev, audience_last_utt=last_listener_utt)
 
             # ensure listener has the utterance in their conversation memory
             listener.memory.conversation.append(Utterance(turn=t, speaker=speaker.name, text=speaker_utt.text, body=speaker_utt.body))
-
+            
             # 2) Audience evaluates true hidden state I_t and generates a feedback response
             print("Listener evaluates and responds... ")
-            I_t, listener_reply = listener.audience_evaluate_and_respond(turn=t, actor_utt=speaker_utt)
+            audience_personality, audience_context = listener.question_check()
+            I_t, listener_init_reply, listener_final_reply = listener.audience_evaluate_and_respond(turn=t, actor_utt=speaker_utt)
+            last_listener_utt = listener_final_reply
 
             # 3) Actor updates particle filter given listener's reply and forms a belief I_hat
             print("Actor updates belief... ")
-            I_hat, ess = speaker.actor_update_particles(turn=t, listener_utt=listener_reply, goal_description=speaker.memory.goal.description)
-
-            # 4) Optional learning/reflection by listener (based on PE of actor's belief)
-            refl = speaker.learning(turn=t)
+            I_hat, ess = speaker.actor_update_particles(turn=t, listener_utt=listener_final_reply, goal_description=speaker.memory.goal.description)
 
             # Compute actor_pe as previous I_hat minus current I_hat
             print("Computing prediction error... ")
@@ -766,11 +877,16 @@ class ConversationStudy:
                 speaker_text=speaker_utt.text,
                 speaker_body=speaker_utt.body,
                 audience_I=I_t,
-                audience_text=listener_reply.text,
-                audience_body=listener_reply.body,
+                audience_text0=listener_init_reply.text,
+                audience_body0=listener_init_reply.body,
+                audience_text=listener_final_reply.text,
+                audience_body=listener_final_reply.body,
                 actor_I_hat=I_hat,
                 actor_pe=actor_pe,
-                reflection_text=refl.text,
+                actor_personality_check=actor_personality,
+                actor_context_check=actor_context,
+                audience_personality_check=audience_personality,
+                audience_context_check=audience_context,
                 ess = float(ess)
             ))
 
@@ -910,15 +1026,26 @@ def main():
     llm = make_openai_llm(model=args.model, temperature=args.temperature, top_p=args.top_p)
     # llm = make_local_llm(model="llama3.1:8b")
 
-    rng = random.Random(args.seed)
     aud_norms = ALL_CULTURAL_NORMS.copy() if not args.no_audience_norms else []
-    traits = ALL_TRAITS.copy() if not args.no_traits else []
+    # Ensure actor/audience trait containers exist even if traits are disabled
+    actor_traits: List[str] = []
+    aud_traits: List[str] = []
+    if not args.no_traits:
+        traits = ALL_TRAITS.copy()
+        # For parametric traits
+        aud_traits = generate_parametric_traits(traits, is_audience=True)
+        actor_traits = generate_parametric_traits(traits, is_audience=False)
+        # For score-based traits (optional alternative)
+        # aud_trait_scores = generate_trait_scores(random.Random(args.seed), traits, is_audience=True)
+        # actor_trait_scores = generate_trait_scores(random.Random(args.seed+1), traits, is_audience=False)
+    else:
+        traits = []
+        aud_traits = []
+        actor_traits = []
     print("Audience cultural norms:", [n.name for n in aud_norms])
     print("Personality traits:", [t.name for t in traits])
 
-    aud_trait_scores = generate_trait_scores(rng, traits, is_audience=True)
-    actor_trait_scores = generate_trait_scores(rng, traits, is_audience=False)
-
+    
 
     # Create agents: Agent A is actor, Agent B is audience
     A = Agent(
@@ -928,8 +1055,8 @@ def main():
         recent_k=args.window,
         seed=args.seed + 1,
         cultural_norms=[],
-        traits=traits,
-        trait_scores=actor_trait_scores,
+        traits=actor_traits,
+        trait_scores=None,
         context=not args.no_context
     )
 
@@ -940,8 +1067,8 @@ def main():
         recent_k=args.window,
         seed=args.seed + 2,
         cultural_norms=aud_norms,
-        traits=traits,
-        trait_scores=aud_trait_scores,
+        traits=aud_traits,
+        trait_scores=None,
         context=not args.no_context
     )
 
