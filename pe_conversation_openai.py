@@ -978,17 +978,17 @@ def main():
         print("Using interview context for both agents...")
 
         interview_role = """
-        Role: Product Manager
+        Role: Customer Service Agent
 
         Responsibilities:
-        - Defining product requirements
-        - Making tradeoff decisions
-        - Communicating priorities clearly
+        - Understanding customer issues and needs
+        - Resolving problems efficiently and accurately
+        - Communicating solutions clearly and empathetically
 
         The interview evaluates:
-        - Structured thinking
-        - Decision rationale
-        - Clarity of communication
+        - Problem-solving ability
+        - Judgment and decision-making under constraints
+        - Clarity and effectiveness of communication
         """
         
         actor_goal = Goal(
@@ -1049,7 +1049,7 @@ def main():
 
     # Create agents: Agent A is actor, Agent B is audience
     A = Agent(
-        name="John",
+        name="Riffer",
         goal=actor_goal,
         llm=llm,
         recent_k=args.window,
@@ -1061,7 +1061,7 @@ def main():
     )
 
     B = Agent(
-        name="Jane",
+        name="Caden",
         goal=audience_goal,
         llm=llm,
         recent_k=args.window,
