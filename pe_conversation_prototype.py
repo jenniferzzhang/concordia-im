@@ -468,6 +468,27 @@ class Agent:
         k = k if k is not None else self.recent_k
         return self.memory.conversation[-k:] if self.memory.conversation else []
 
+
+    def memory_check(self) -> str:
+        """Summarize the full conversation so far in one paragraph."""
+        if not self.memory.conversation:
+            return "No conversation has occurred yet."
+
+        convo = "\n".join(
+            f"- [t={u.turn} {u.actor}] DIALOGUE: {u.text} | BODY: {u.body}"
+            for u in self.memory.conversation
+        )
+
+        prompt = self._prompt_header() + f"""Summarize the full conversation so far in one concise paragraph.
+        Focus on: key points raised, tone progression, and current interaction dynamics.
+        Do not invent details not present in the transcript.
+
+        Conversation transcript:
+        {convo}
+        """
+
+        return self.llm(prompt).strip()
+
     def format_conversation(self, conv: List[Utterance]) -> str:
         """Format a list of Utterances into a compact, readable block.
 
@@ -606,12 +627,16 @@ class Agent:
         I_t = max(0.0, min(1.0, I_t))
 
         conv_k = self.recent_conversation(self.recent_k)
+        memory_summary = self.memory_check()
 
         resp_prompt = self._prompt_header() + f"""You rated the {actor_name} with score {I_t:.2f} on a scale from 0 to 1, where 0 indicates "not at all", and 1 indicates "to a great extent".
         Consider recent conversation history in forming your response, while matching your score in sentiment.
         
         Recent conversation (last {self.recent_k}):
         {self.format_conversation(conv_k)}
+
+        Full conversation summary (all turns so far):
+        {memory_summary}
         
         Produce a reply that reflects your evaluation of the {actor_name}’s competence and matches your score.
         """
@@ -771,8 +796,17 @@ class Agent:
         Parse the output via regex and fallback to the raw response when
         the format is not followed strictly.
         """
+        conv_k = self.recent_conversation(self.recent_k)
+        memory_summary = self.memory_check()
+
         prompt = self._prompt_header() + f"""The ideal value of the goal is: {self.memory.goal.ideal:.2f}.
         You must talk and behave with the aim of achieving the goal and maximizing it to its ideal value.
+
+        Recent conversation (last {self.recent_k}):
+        {self.format_conversation(conv_k)}
+
+        Full conversation summary (all turns so far):
+        {memory_summary}
 
         Produce a short utterance (one sentence) to the audience to accomplish the goal, and include a very brief body language description.
         Output in this format exactly:
@@ -795,6 +829,7 @@ class Agent:
         whether their previous moves had the intended effect.
         """
         conv_k = self.recent_conversation(self.recent_k)
+        memory_summary = self.memory_check()
 
         def fmt_ihat(h: Dict[str, float]) -> str:
             return f"(turn {int(h.get('turn', 0))}) I_hat={h.get('I_hat', 0.5):.2f}"
@@ -814,6 +849,9 @@ class Agent:
 
         Recent conversation (last {self.recent_k}):
         {self.format_conversation(conv_k)}
+
+        Full conversation summary (all turns so far):
+        {memory_summary}
 
         Recent I_hat (belief) history:
         {chr(10).join("- " + fmt_ihat(h) for h in ihat_k) or "- (none)"}
